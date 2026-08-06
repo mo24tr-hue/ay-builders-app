@@ -1543,7 +1543,8 @@ className={`bg-white border border-black rounded-md flex items-stretch overflow-
       )}
 
 
-      {/* Change orders */}
+      {/* Change orders — admin + customer only (not team) */}
+      {(isAdmin || isCustomer) && (
       <div className="bg-white border border-black rounded-md p-4 mb-4">
         <div className="flex items-center justify-between gap-2 mb-2">
           <h3 className="text-[11px] font-mono uppercase text-[#6B6E72]">Change orders</h3>
@@ -1574,12 +1575,13 @@ className={`bg-white border border-black rounded-md flex items-stretch overflow-
                               color: st === 'pending' || st === 'quoted' ? '#8A6D00' : st === 'rejected' ? '#B5533C' : '#3F7D58',
                             }}
                           >
-                            {st}
+                            {st === 'quoted' ? 'Offer sent' : st === 'rejected' ? 'Declined' : st === 'approved' ? 'Accepted' : st === 'pending' ? 'Customer request' : st}
                           </span>
                         </div>
                         <div className="text-[10px] font-mono text-[#8A8D91] mt-0.5">
                           {fmtDate(co.created_at)}
                           {phaseName ? ` · ${phaseName}` : ''}
+                          {co.origin === 'admin_offer' ? ' · Contractor offer' : ''}
                         </div>
                       </div>
                       {isAdmin && (
@@ -1605,11 +1607,21 @@ className={`bg-white border border-black rounded-md flex items-stretch overflow-
                     )}
                     {(isAdmin || isCustomer) && (co.amount != null && co.amount !== '') && (
                       <div className="text-sm mt-2 font-medium">
-                        Quoted amount: ${Number(co.amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        {co.origin === 'admin_offer' ? 'Offer amount' : 'Quoted amount'}: ${Number(co.amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                       </div>
                     )}
                     {(isAdmin || isCustomer) && co.admin_reply && (
                       <p className="text-xs mt-1 text-[#6B6E72] whitespace-pre-wrap">{co.admin_reply}</p>
+                    )}
+                    {isAdmin && st === 'rejected' && (
+                      <p className="text-xs mt-2 text-[#B5533C]">
+                        Customer declined{co.decided_at ? ` on ${fmtDate(co.decided_at)}` : ''}. Kept for your records.
+                      </p>
+                    )}
+                    {isAdmin && st === 'approved' && co.origin === 'admin_offer' && (
+                      <p className="text-xs mt-2 text-[#3F7D58]">
+                        Customer accepted this offer{co.decided_at ? ` on ${fmtDate(co.decided_at)}` : ''}.
+                      </p>
                     )}
                     {isAdmin && st === 'pending' && (
                       <QuoteReplyForm
@@ -1660,16 +1672,15 @@ className={`bg-white border border-black rounded-md flex items-stretch overflow-
               })}
           </div>
         )}
-        {(isAdmin || isCustomer) && (
-          <ChangeOrderForm
+        <ChangeOrderForm
             project={project}
             profile={profile}
             isAdmin={isAdmin}
             onDone={onReload}
             logActivity={logActivity}
           />
-        )}
       </div>
+      )}
 
 
 
@@ -2224,6 +2235,7 @@ function ChangeOrderForm({ project, profile, isAdmin, onDone, logActivity, defau
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [phaseId, setPhaseId] = useState(defaultPhaseId || '')
+  const [amount, setAmount] = useState('')
   const [file, setFile] = useState(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -2235,6 +2247,14 @@ function ChangeOrderForm({ project, profile, isAdmin, onDone, logActivity, defau
     if (!title.trim()) {
       setError('Enter a title for this change order.')
       return
+    }
+    let amountNum = null
+    if (isAdmin) {
+      amountNum = parseFloat(String(amount).replace(/[^0-9.]/g, ''))
+      if (!Number.isFinite(amountNum) || amountNum < 0) {
+        setError('Enter the dollar amount for this offer to the customer.')
+        return
+      }
     }
     setSaving(true)
     try {
@@ -2252,8 +2272,9 @@ function ChangeOrderForm({ project, profile, isAdmin, onDone, logActivity, defau
         storage_path = path
         public_url = pub.publicUrl
       }
-      const status = isAdmin ? 'approved' : 'pending'
-      const { error: insErr } = await supabase.from('change_orders').insert({
+      // Admin → offer to customer (quoted + amount). Customer → request (pending).
+      const status = isAdmin ? 'quoted' : 'pending'
+      const row = {
         project_id: project.id,
         phase_id: phaseId || null,
         title: title.trim(),
@@ -2262,11 +2283,32 @@ function ChangeOrderForm({ project, profile, isAdmin, onDone, logActivity, defau
         public_url,
         created_by: profile.id,
         status,
-      })
+      }
+      if (isAdmin) {
+        row.amount = amountNum
+        row.origin = 'admin_offer'
+        row.admin_reply = description.trim() || null
+      }
+      const { error: insErr } = await supabase.from('change_orders').insert(row)
       if (insErr) throw insErr
-      await logActivity?.(isAdmin ? 'added change order' : 'requested change order', title.trim())
+      await logActivity?.(
+        isAdmin ? 'sent change order offer' : 'requested change order',
+        isAdmin ? (title.trim() + ' — $' + amountNum.toFixed(2)) : title.trim()
+      )
+      if (isAdmin) {
+        try {
+          await supabase.rpc('notify_project_customers', {
+            p_company_id: profile.company_id,
+            p_project_id: project.id,
+            p_title: 'Change order offer',
+            p_body: title.trim() + ' — $' + amountNum.toFixed(2),
+            p_kind: 'change_order_offer',
+          })
+        } catch (_) {}
+      }
       setTitle('')
       setDescription('')
+      setAmount('')
       setFile(null)
       if (!defaultPhaseId) setPhaseId('')
       onDone?.()
@@ -2279,21 +2321,39 @@ function ChangeOrderForm({ project, profile, isAdmin, onDone, logActivity, defau
   return (
     <form onSubmit={submit} className="border border-dashed border-black rounded p-3 space-y-2 mt-2">
       <div className="text-[11px] font-mono uppercase text-[#6B6E72]">
-        {isAdmin ? 'Add change order' : 'Request a change'}
+        {isAdmin ? 'Send offer to customer' : 'Request a change'}
       </div>
       <input
         value={title}
         onChange={(e) => setTitle(e.target.value)}
-        placeholder="Title"
+        placeholder={isAdmin ? 'e.g. Foundation waterproofing' : 'Title'}
         className="w-full border border-black rounded px-3 py-2 text-sm"
       />
       <textarea
         value={description}
         onChange={(e) => setDescription(e.target.value)}
-        placeholder="Description"
+        placeholder={isAdmin ? 'Why this work is recommended and what is included' : 'Description'}
         rows={3}
         className="w-full border border-black rounded px-3 py-2 text-sm"
       />
+      {isAdmin && (
+        <div>
+          <label className="block text-[11px] font-mono uppercase text-[#6B6E72] mb-1">Amount (required)</label>
+          <div className="flex items-center gap-2">
+            <span className="text-sm">$</span>
+            <input
+              type="number"
+              inputMode="decimal"
+              min="0"
+              step="0.01"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              placeholder="0.00"
+              className="flex-1 border border-black rounded px-3 py-2 text-sm"
+            />
+          </div>
+        </div>
+      )}
       {!defaultPhaseId && phases.length > 0 && (
         <select
           value={phaseId}
@@ -2312,7 +2372,7 @@ function ChangeOrderForm({ project, profile, isAdmin, onDone, logActivity, defau
       </label>
       {error && <p className="text-xs text-[#B5533C]">{error}</p>}
       <button type="submit" disabled={saving} className="w-full py-2 rounded text-sm text-white bg-black disabled:opacity-50">
-        {saving ? 'Saving…' : isAdmin ? 'Save change order' : 'Submit request'}
+        {saving ? 'Saving…' : isAdmin ? 'Send offer to customer' : 'Submit request'}
       </button>
     </form>
   )
