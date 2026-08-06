@@ -1,5 +1,5 @@
 /* PWA service worker — safe fetch handling (never return null) */
-const CACHE = 'BuildWatch-v3'
+const CACHE = 'BuildWatch-v4'
 
 self.addEventListener('install', (event) => {
   self.skipWaiting()
