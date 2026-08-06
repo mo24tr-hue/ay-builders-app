@@ -59,7 +59,16 @@ function SwipeDeleteRow({ children, onDelete }) {
   )
 }
 
+function titleCase(str) {
+  if (!str) return ''
+  return String(str)
+    .split(/\s+/)
+    .map((w) => (w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : ''))
+    .join(' ')
+}
+
 function formatStyleLabel(style) {
+
   if (!style) return '—'
   if (STYLES[style]?.label) return STYLES[style].label
   // strip legacy "custom_" prefix and underscores from older data
@@ -239,42 +248,58 @@ export default function Dashboard({ session, profile, company, onCompanyUpdate, 
 
   const activeProject = projects.find((p) => p.id === activeId) || null
 
-  const logActivity = async (action, detail, projectId = null) => {
+  const logActivity = async (action, detail, projectId = null, phaseName = null) => {
+    const pid = projectId || activeId || null
+    const proj = projects.find((p) => p.id === pid) || activeProject
+    const projectLabel = (proj && (proj.address || proj.name)) || null
+    const phaseLabel = phaseName || null
+    const whereBits = []
+    if (projectLabel) whereBits.push(projectLabel)
+    if (phaseLabel) whereBits.push('Phase: ' + phaseLabel)
+    const whereLine = whereBits.length ? whereBits.join(' · ') : null
+
     await supabase.from('activity').insert({
       company_id: profile.company_id,
       user_id: profile.id,
       user_email: profile.email,
       user_name: profile.name,
       action,
-      detail,
-      project_id: projectId || activeId || null,
+      detail: [detail, whereLine].filter(Boolean).join(' — '),
+      project_id: pid,
     })
-    // Notify admins when team/customer (or any non-self noise) changes things
-    // Always notify for customer/team actions; also for key events from anyone except pure admin self-edits of notes
+
+    const notifTitle = titleCase(action)
+    const who = profile.name || profile.email || 'User'
+    const bodyParts = []
+    if (whereLine) bodyParts.push(whereLine)
+    if (detail) bodyParts.push(who + ': ' + detail)
+    else bodyParts.push(who)
+    const notifBody = bodyParts.join('\n')
+
     if (profile?.company_id && profile?.role !== 'admin') {
       try {
         await supabase.rpc('notify_company_admins', {
           p_company_id: profile.company_id,
-          p_project_id: projectId || activeId || null,
-          p_title: action,
-          p_body: (profile.name || profile.email || 'User') + (detail ? ': ' + detail : ''),
+          p_project_id: pid,
+          p_title: notifTitle,
+          p_body: notifBody,
           p_kind: action,
         })
       } catch (_) {}
     } else if (profile?.company_id && profile?.role === 'admin') {
-      // Admin actions that other admins may care about (quotes, etc.) — optional light set
       const shareWithAdmins = [
         'quoted change order',
         'approved change order',
         'rejected change order',
+        'sent change order offer',
       ]
       if (shareWithAdmins.some((k) => action.includes(k) || action === k)) {
         try {
           await supabase.rpc('notify_company_admins', {
             p_company_id: profile.company_id,
-            p_project_id: projectId || activeId || null,
-            p_title: action,
-            p_body: detail || '',
+            p_project_id: pid,
+            p_title: notifTitle,
+            p_body: [whereLine, detail].filter(Boolean).join('\n') || detail || '',
             p_kind: action,
           })
         } catch (_) {}
@@ -707,8 +732,21 @@ export default function Dashboard({ session, profile, company, onCompanyUpdate, 
                         }
                       }}
                     >
-                      <div className="text-sm font-medium">{n.title}</div>
-                      {n.body && <div className="text-xs text-[#6B6E72] mt-0.5">{n.body}</div>}
+                      <div className="text-sm font-medium">{titleCase(n.title)}</div>
+                      {(() => {
+                        const proj = projects.find((p) => p.id === n.project_id)
+                        const projLine = proj?.address || null
+                        return (
+                          <>
+                            {projLine && (
+                              <div className="text-xs text-[#16324F] mt-0.5 font-medium">{projLine}</div>
+                            )}
+                            {n.body && (
+                              <div className="text-xs text-[#6B6E72] mt-0.5 whitespace-pre-wrap">{n.body}</div>
+                            )}
+                          </>
+                        )
+                      })()}
                       <div className="text-[10px] font-mono text-[#8A8D91] mt-1">{fmtDate(n.created_at)}</div>
                     </button>
                   </SwipeDeleteRow>
@@ -1191,7 +1229,7 @@ function ProjectDetail({ project, isAdmin, canUpload, isCustomer, profile, onBac
     if (!isAdmin) return
     const next = nextPhaseStatus(phase.status)
     await supabase.from('phases').update({ status: next }).eq('id', phase.id)
-    await logActivity('updated phase status', phase.name)
+    await logActivity('updated phase status', phase.name, project.id, phase.name)
     onReload()
   }
 
@@ -1212,7 +1250,7 @@ function ProjectDetail({ project, isAdmin, canUpload, isCustomer, profile, onBac
       return
     }
     setNewPhaseName('')
-    await logActivity('added phase', name)
+    await logActivity('added phase', name, project.id, name)
     onReload()
   }
 
@@ -1976,12 +2014,12 @@ function PhaseTasks({ phase, project, isAdmin, profile, onReload, logActivity })
       await supabase.rpc('notify_project_team', {
         p_company_id: profile.company_id,
         p_project_id: project.id,
-        p_title: 'New task — ' + (phase.name || 'phase'),
-        p_body: title.trim(),
+        p_title: titleCase('New task'),
+        p_body: (project.address ? project.address + '\n' : '') + 'Phase: ' + (phase.name || '—') + '\n' + title.trim(),
         p_kind: 'task',
       })
     } catch (_) {}
-    await logActivity?.('created task', (phase.name || '') + ': ' + title.trim(), project.id)
+    await logActivity?.('created task', title.trim(), project.id, phase.name)
     setTitle('')
     setDescription('')
     onReload?.()
@@ -1997,7 +2035,7 @@ function PhaseTasks({ phase, project, isAdmin, profile, onReload, logActivity })
       alert(error.message)
       return
     }
-    await logActivity?.('completed task', task.title, project.id)
+    await logActivity?.('completed task', task.title, project.id, phase.name)
     onReload?.()
   }
 
@@ -2040,7 +2078,7 @@ function PhaseTasks({ phase, project, isAdmin, profile, onReload, logActivity })
       })
       if (insErr) throw insErr
       // One notification only (via logActivity for team/customer)
-      await logActivity?.('uploaded task photo', (phase.name || '') + ' — ' + task.title, project.id)
+      await logActivity?.('uploaded task photo', task.title, project.id, phase.name)
       onReload?.()
     } catch (err) {
       alert(err.message || 'Upload failed')
@@ -2196,7 +2234,7 @@ function QuoteReplyForm({ changeOrder, profile, logActivity, onDone }) {
       await supabase.rpc('notify_project_customers', {
         p_company_id: profile.company_id,
         p_project_id: changeOrder.project_id,
-        p_title: 'Change order quote',
+        p_title: titleCase('Change order quote'),
         p_body: changeOrder.title + ' — $' + n.toFixed(2),
         p_kind: 'change_order_quote',
       })
@@ -2300,8 +2338,8 @@ function ChangeOrderForm({ project, profile, isAdmin, onDone, logActivity, defau
           await supabase.rpc('notify_project_customers', {
             p_company_id: profile.company_id,
             p_project_id: project.id,
-            p_title: 'Change order offer',
-            p_body: title.trim() + ' — $' + amountNum.toFixed(2),
+            p_title: titleCase('Change order offer'),
+            p_body: (project.address ? project.address + '\n' : '') + (phaseId ? 'Phase: ' + (phases.find((ph) => ph.id === phaseId)?.name || '') + '\n' : '') + title.trim() + ' — $' + amountNum.toFixed(2),
             p_kind: 'change_order_offer',
           })
         } catch (_) {}
@@ -2459,7 +2497,7 @@ function PhaseDetail({ phase, project, isAdmin, canUpload, isCustomer, profile, 
         uploaded_by: profile.id,
       })
       if (insErr) throw insErr
-      await logActivity?.('uploaded phase file', phase.name + ': ' + file.name)
+      await logActivity?.('uploaded phase file', file.name, project.id, phase.name)
       onReload()
     } catch (err) {
       alert(err.message || 'Upload failed')
@@ -2511,7 +2549,7 @@ function PhaseDetail({ phase, project, isAdmin, canUpload, isCustomer, profile, 
         ok++
       }
       if (ok) {
-        await logActivity('uploaded media', phase.name + ' (' + ok + ' file' + (ok > 1 ? 's' : '') + ')')
+        await logActivity('uploaded media', ok + ' file' + (ok > 1 ? 's' : ''), project.id, phase.name)
         setCaption('')
         onReload()
       }
@@ -2590,7 +2628,7 @@ function PhaseDetail({ phase, project, isAdmin, canUpload, isCustomer, profile, 
       alert(error.message)
       return
     }
-    await logActivity('deleted phase', phase.name)
+    await logActivity('deleted phase', phase.name, project.id, phase.name)
     onBack()
     onReload()
   }
